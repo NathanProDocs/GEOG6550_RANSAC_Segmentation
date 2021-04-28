@@ -1,0 +1,325 @@
+import strformat, strabo/lidar, kdtree, cligen, times, strutils, arraymancer, random
+from math import arccos, radToDeg, sqrt
+
+var startingTime = cpuTime()
+randomize() # Must be called at beginning of script to ensure RNG works correctly
+
+type
+    Point3D = object 
+        x, y, z: float64  
+        
+    Plane* = object 
+        a, b, c, d: float64
+
+    KdPoint* = array[K, float64] # A KdPoint is a location in K-dimensional space.
+
+proc newPoint*(x, y, z: float64): Point3D = 
+    result = Point3D(x: x, y: y, z: z)
+
+proc `+=`(self: var Point3D, p: Point3D) = 
+    self.x += p.x
+    self.y += p.y
+    self.z += p.z
+
+proc `-`(p1: Point3D, p2: Point3D): Point3D = 
+    result = Point3D(x: p1.x - p2.x, y: p1.y - p2.y, z: p1.z - p2.z)
+
+proc `*`(p1: Point3D, value: float64): Point3D =
+    result = Point3D(x: p1.x * value, y: p1.y * value, z: p1.z * value)
+
+proc zero*(): Plane =
+    result = Plane(a: 0'f64, b: 0'f64, c: 0'f64, d: 0'f64)
+
+proc fromPoints*(points: openArray[Point3D]): Plane =
+    let n = points.len()
+    if n < 3:
+        return zero()
+
+    var sum = newPoint(0.0, 0.0, 0.0)
+    for p in points:
+        sum += p
+
+    var 
+        centroid = sum * (1.0 / (n.float64))
+        xx = 0.0'f64
+        xy = 0.0'f64
+        xz = 0.0'f64
+        yy = 0.0'f64
+        yz = 0.0'f64
+        zz = 0.0'f64
+
+    for p in points:
+        let r = p - centroid 
+        xx += r.x * r.x
+        xy += r.x * r.y 
+        xz += r.x * r.z       
+        yy += r.y * r.y
+        yz += r.y * r.z
+        zz += r.z * r.z
+
+    let 
+        detX = yy * zz - yz * yz
+        detY = xx * zz - xz * xz
+        detZ = xx * yy - xy * xy
+        detMax = detX.max(detY).max(detZ) 
+
+    var
+        a: float64
+        b: float64
+        c: float64
+
+    if detMax == detX:
+        a = 1.0
+        b = (xz * yz - xy * zz) / detX
+        c = (xy * yz - xz * yy) / detX
+    elif detMax == detY:
+        a = (yz * xz - xy * zz) / detY
+        b = 1.0
+        c = (xy * xz - yz * xx) / detY
+    else:
+        a = (yz * xy - xz * yy) / detZ
+        b = (xz * xy - yz * xx) / detZ
+        c = 1.0
+
+    let norm = (a * a + b * b + c * c).sqrt()
+    a /= norm
+    b /= norm
+    c /= norm
+    let d = -a * centroid.x + -b * centroid.y + -c * centroid.z
+
+    #assign the final values for a, b, c, d to a plane (must be => 3 points and not vertical)
+    result = Plane(a: a, b: b, c: c, d: d)
+
+proc normLength*(self: var Plane): float64 = 
+    result = (self.a * self.a + self.b * self.b + self.c * self.c).sqrt()
+
+proc residual*(self: var Plane, p: Point3D): float64 =
+    result = (self.a * p.x + self.b * p.y  + self.c * p.z  + self.d).abs() / normLength(self) 
+
+proc rmse*(self: var Plane, points: openArray[Point3D]): float64 = 
+    var
+        rmse = 0.0'f64 
+        z: float64
+        norm = self.normLength()
+
+    for p in points:
+        z = (self.a * p.x + self.b * p.y + self.c * p.z + self.d) / norm 
+        rmse += z * z
+    
+    result = (rmse / points.len().float64).sqrt() 
+
+proc slope*(self: var Plane): float64 =
+    result = self.c.abs().arccos().radToDeg() 
+
+proc run(wd: string, lidarFile: string, outputFile: string, searchDist: float64, iterations: int, threshold: float64, maxSlope: float64, numSamples: int, acceptableModelSize: int) = 
+
+    let searchDistSqr = searchDist * searchDist 
+    echo("Reading in points...\n")
+
+    var 
+        lidarFile = lidarFile.replace("\'", "")
+        outputFile = outputFile.replace("\'", "")
+
+        # setup sequence and input/output variables
+        las = newLasFile(lidarFile)
+        output = initializeUsingFile(outputFile, las)
+        pointsA = newSeqOfCap[array[K, float]](las.header.numberOfPoints) 
+        # K = dimensionality of the array, must change K in definition to change dimensionality 
+        values = newSeqOfCap[int](las.header.numberOfPoints)
+        
+        # declare variables of type
+        nPoints = las.header.numberOfPoints.int
+        modelContainsCenterPoint: bool
+        rmse: float64
+        index: int 
+        progress: int
+
+        p1: PointRecord3
+        p2: XYZData
+        bestModel: Plane
+        betterModel: Plane
+        
+        # initialize misc variables
+        oldProgress = 1
+        largerOfSamples = numSamples.max(acceptableModelSize)
+        lastOnlyReturn = newSeqOfCap[bool](las.header.numberOfPoints)
+        isPlanarSurface = newSeq[bool](nPoints)
+
+    ########################################################
+    ###Step 01: Filter off all intermidiate return points###
+    ########################################################
+    
+    for p in 0..<las.header.numberOfPoints.int:
+        p1 = las.getPointRecord(p)
+        if p1.classfield.classification != lowPoint and p1.classField.classification != highNoise:
+            if p1.bitfield.returnNumber() == p1.bitfield.numberOfReturns():
+                pointsA.add([p1.x, p1.y, p1.z])
+                values.add(p)
+                lastOnlyReturn.add(true)
+            else:
+                lastOnlyReturn.add(false)
+
+        progress = (100.0 * (p.float + 1.0) / las.header.numberOfPoints.float).int  
+        if progress mod 1 == 0 and progress != oldProgress:
+            oldProgress = progress
+            echo(&"Reading input data & creating point/values array: {progress}%")
+
+    echo("Program may freeze due to long processing times.\nPlease allow for 1:00 minute of processing time\nto construct Kdtree")
+    echo("\nbuilding Kdtree...\n")
+    var tree = newkdtree[int](pointsA, values)
+    echo("Tree Complete...\n") 
+    echo("Program may freeze during processing, processing times vary \nby file size and may take up to 15:00 minutes to run.\n")
+    
+    for p in 0..<las.header.numberOfPoints.int: 
+        p1 = las.getPointRecord(p)
+        bestModel = zero() #initialize the bestModel variable as a zeroed plane
+        if p1.classfield.classification != lowPoint and p1.classField.classification != highNoise: 
+            var 
+                centerPoint = newPoint(p1.x, p1.y, p1.z)
+                ret = tree.withinRadius([p1.x, p1.y, p1.z], radius=searchDistSqr, sortResults=true) 
+                n = ret.len() 
+                pointSeq = newSeqOfCap[Point3D](n)         
+                modelFound = false
+
+            if n > largerOfSamples: 
+                for i in 0..<n:
+                    index = ret[i][1] 
+                    p2 = las[index]
+                    pointSeq.add(newPoint(p2.x, p2.y, p2.z))
+
+                var minRMSE = Inf
+                for i in 0..<iterations: 
+                    var pointsB = newSeqOfCap[Point3D](numSamples) 
+
+                    for j in 0..<numSamples:  
+                        let randomIndex = rand(n-1)
+                        pointsB.add(pointSeq[randomIndex]) 
+
+                    var model = fromPoints(pointsB)
+                    if model.slope() < maxSlope: 
+                        var inliers = newSeqOfCap[Point3D](i) 
+                        for q in 0..<n: 
+                            if model.residual(pointSeq[q]) < threshold: 
+                                inliers.add(pointSeq[q])
+
+                        if inliers.len() >= acceptableModelSize:
+                            betterModel = fromPoints(inliers)
+                            rmse = betterModel.rmse(inliers)
+                            modelContainsCenterPoint = betterModel.residual(centerPoint) < threshold 
+                            
+                            if rmse < minRMSE and modelContainsCenterPoint:
+                                minRMSE = rmse
+                                bestModel = betterModel
+                                modelFound = true
+                                if inliers.len() == n or minRMSE == 0'f64:
+                                    break
+            
+            if modelFound:
+                for j in 0..<n:
+                    index = ret[j][1] 
+                    if bestModel.residual(pointSeq[j]) <= threshold:
+                        isPlanarSurface[index] = true
+
+        progress = (100.0 * (p.float + 1.0) / las.header.numberOfPoints.float).int  
+        if progress mod 1 == 0 and progress != oldProgress:
+            oldProgress = progress
+            echo(&"Iterating through each neighbourhood: {progress}%")
+
+    #########################
+    ## Now output the data ##
+    #########################
+    
+    for pointNum in 0..<las.header.numberOfPoints.int:
+        var pr = las.getPointRecord(pointNum)
+        if isPlanarSurface[pointNum] and lastOnlyReturn[pointNum]: 
+            pr.classField.setClassification(neverClassified) # class category names
+        else:
+            pr.classField.setClassification(unclassified)
+        output.addPointRecord(pr)
+    
+        progress = (100.0 * (pointNum.float + 1.0) / las.header.numberOfPoints.float).int  
+        if progress mod 1 == 0 and progress != oldProgress:
+            oldProgress = progress
+            echo(&"Outputting Data: {progress}%")
+
+    var time = (cpuTime() - startingTime) / 60
+    output.write()
+    echo(fmt"Elapsed Time: {time} Minutes, Done!")
+
+#Beginning of user-defined variables using Cligen#
+proc getinfo() = 
+
+    write(stdout, "Working Directory: ") 
+    let wd = readLine(stdin)
+
+    write(stdout, "LiDAR Input File: ") 
+    let lidarFile = readLine(stdin)
+    doAssert len(lidarFile) > 0, "Error input file name is empty."
+
+    write(stdout, "Output File: ") 
+    let outputFile = readLine(stdin)
+    doAssert len(outputFile) > 0, "Error output file name is empty."
+
+    var searchDist = float(1.5) 
+    write(stdout, "Search distance (default = 1.5): ")
+    let searchDistUD = readline(stdin)
+    if len(searchDistUD) > 0:
+        searchDist = parseFloat(searchDistUD)
+
+    var iterations = int(50) 
+    write(stdout, "Number of iterations (default = 50): ")
+    let iterationsUD = readline(stdin)
+    if len(iterationsUD) > 0:
+        iterations = parseInt(iterationsUD)
+
+    var threshold = float(0.15) 
+    write(stdout, "Threshold of residuals (default = 0.15): ")
+    let thresholdUD = readline(stdin)
+    if len(thresholdUD) > 0:
+        threshold = parseFloat(thresholdUD)
+
+    var maxSlope = float(0.15) 
+    write(stdout, "Maximum slope of plane segments (default = 60.0): ")
+    let maxSlopeUD = readline(stdin)
+    if len(maxSlopeUD) > 0:
+        maxSlope = parseFloat(maxSlopeUD)
+
+    var numSamples = int(10) 
+    write(stdout, "Number of samples (default = 10): ")
+    let numSamplesUD = readline(stdin)
+    if len(numSamplesUD) > 0:
+        numSamples = parseInt(numSamplesUD)
+
+    var acceptableModelSize = int(30) 
+    write(stdout, "What is the minimum acceptable model size (default = 30): ")
+    let acceptableModelSizeUD = readline(stdin)
+    if len(acceptableModelSizeUD) > 0:
+        acceptableModelSize = parseInt(acceptableModelSizeUD)
+
+    # Appending the file name to the working directory if entered correctly #
+    var inFile = if wd.len() > 0:
+            wd & lidarFile 
+        else:
+            lidarFile
+
+    var outFile = if wd.len() > 0:
+            wd & outputFile
+        else:
+            outputFile
+    
+    run(wd, inFile, outFile, searchDist, iterations, threshold, maxSlope, numSamples, acceptableModelSize)
+    
+proc main() = 
+    dispatchMulti([run, help={
+            "wd": "Working Directory.", 
+            "lidarFile": "Name of your input .las file.", 
+            "outputFile": "Name of output .las file.", 
+            "searchDist": "Radius distance used in neighbourhood calculation.",
+            "iterations": "Number of iterations used in sampling.",
+            "threshold": "Threshold value limiting residuals.",
+            "maxSlope": "Maximum slope of plane segments.",
+            "numSamples": "Number of samples within sampling sequence.",
+            "acceptableModelSize": "Minimum acceptable number of points for the model."}],
+        [getinfo]
+        )
+main()
